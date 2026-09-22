@@ -8,7 +8,7 @@ Evaluating environmental controls on dryland forest Gross Primary Productivity (
 This repository is structured around the four main stages of the research methodology:
 
 ### Stage 1: Development and Evaluation of the Remote-Sensing GPP Model
-**Objective:** Calibrate and evaluate a high-resolution remote-sensing GPP model based on Sentinel-2-derived canopy chlorophyll absorption and remotely sensed PAR, validated against continuous Eddy Covariance (EC) measurements from seven dryland conifer forest sites.
+**Objective:** Calibrate and evaluate a high-spatial-resolution remote-sensing GPP model based on Sentinel-2-derived canopy chlorophyll absorption and remotely sensed PAR, validated against continuous Eddy Covariance (EC) measurements from seven dryland conifer forest sites.
 
 **Methodology & Scripts:**
 1. **EC Data & Footprint Processing** (`foot_print_EC_ES_Hen2`)
@@ -26,7 +26,7 @@ This repository is structured around the four main stages of the research method
    * Integrated spaceborne PAR products from MODIS (MCD18C2) and ERA5-Land, synchronizing them with Sentinel-2 acquisition dates.
    * Converted values to common units [mol m⁻² day⁻¹] and calibrated the satellite-derived PAR against in-situ EC tower measurements using a linear transfer equation to correct systematic differences.
 5. **GPP Calibration & Validation**
-   * Computed chlorophyll absorption at 705 nm (α₇₀₅) from Band 8 (NIR) and Band 5 (Red-edge) using the Kubelka-Munk formulation.
+   * Computed chlorophyll absorption at 705 nm (α₇₀₅) from Band 8 (NIR) and Band 5 (Red-edge) using the Kubelka-Munk formulation based on Gitelson et al., 2019, 2021.
    * Calculated footprint-level statistical summaries, selecting a 7-day centered moving average for optimal calibration.
    * Fitted the general GPP estimation model: `GPP = a * (α_λ * PAR) + b`.
    * Evaluated the model's accuracy sequentially—first using in-situ PAR, then substituting calibrated satellite-derived PAR—assessing performance across individual and pooled sites via R², RMSE, MAE, CV, NRMSE, and bias.
@@ -83,7 +83,7 @@ This repository is structured around the four main stages of the research method
 **Objective:** Open the LSTM "black box" to characterize the relative model-attributed contribution, direction of environmental features, and influence of antecedent conditions.
 
 **Methodology & Scripts:**
-1. **Lag Analysis & Performance Metrics**
+1. **Lag Analysis & Performance Metrics** (`running_LSTM_final_with_LAI_no_LAI`)
    * Executed the LSTM across **multiple antecedent temporal lags** (7, 14, 30, 60, 90, 120, 180, and 270 days) to evaluate the time window in which past meteorological conditions influence current daily GPP.
    * Assessed model performance across windows using R², RMSE, MAE, and Bias.
 2. **SHAP Extraction** (`running_LSTM_final_with_LAI_no_LAI`)
