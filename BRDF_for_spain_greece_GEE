@@ -1,0 +1,126 @@
+// ------------------------------------------------------------
+// HLS S30 NBAR extraction for GPP model testing
+// ------------------------------------------------------------
+
+// Replace with your site polygons or points
+var sites = geometry
+
+// Important: make sure your feature collection has a site-name column.
+// Example: "site"
+var siteField = 'site';
+
+var startDate = '2017-01-01';
+var endDate   = '2026-01-01';
+
+// HLS Sentinel-2 NBAR collection
+var hls = ee.ImageCollection('NASA/HLS/HLSS30/v002')
+  .filterDate(startDate, endDate)
+  .filterBounds(sites)
+  .filter(ee.Filter.lt('CLOUD_COVERAGE', 50));
+
+// Mask clouds, cloud shadow, adjacent cloud/shadow, snow
+function maskHLS(img) {
+  var fmask = img.select('Fmask');
+
+  var cloud    = fmask.bitwiseAnd(1 << 1).neq(0);
+  var adjacent = fmask.bitwiseAnd(1 << 2).neq(0);
+  var shadow   = fmask.bitwiseAnd(1 << 3).neq(0);
+  var snow     = fmask.bitwiseAnd(1 << 4).neq(0);
+
+  var mask = cloud.or(adjacent).or(shadow).or(snow).not();
+
+  return img.updateMask(mask);
+}
+
+// Convert reflectance to 0-1 if needed.
+// HLS stores scale metadata. If your printed values are already 0-1,
+// remove the multiply/add part.
+function scaleHLS(img) {
+  var bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'];
+
+  var scale = ee.Number(
+    ee.Algorithms.If(
+      img.propertyNames().contains('REF_SCALE_FACTOR'),
+      img.get('REF_SCALE_FACTOR'),
+      0.0001
+    )
+  );
+
+  var offset = ee.Number(
+    ee.Algorithms.If(
+      img.propertyNames().contains('ADD_OFFSET'),
+      img.get('ADD_OFFSET'),
+      0
+    )
+  );
+
+  var refl = img.select(bands).multiply(scale).add(offset);
+
+  return img.addBands(refl, null, true);
+}
+
+function addIndices(img) {
+  var blue = img.select('B2');
+  var red  = img.select('B4');
+  var re705 = img.select('B5');
+  var re783 = img.select('B7');
+  var nir  = img.select('B8');
+
+  var ndvi = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  var evi = nir.subtract(red).multiply(2.5)
+    .divide(
+      nir.add(red.multiply(6))
+        .subtract(blue.multiply(7.5))
+        .add(1)
+    )
+    .rename('EVI');
+
+  var aRE = re783.divide(re705)
+    .subtract(1)
+    .rename('aRE');
+
+  return img.addBands([ndvi, evi, aRE])
+    .set('date', img.date().format('YYYY-MM-dd'))
+    .set('year', img.date().get('year'))
+    .set('month', img.date().get('month'));
+}
+
+var hlsProcessed = hls
+  .map(maskHLS)
+  .map(scaleHLS)
+  .map(addIndices);
+
+// Extract site means
+var extracted = hlsProcessed.map(function(img) {
+  var out = img.select([
+      'B2','B4','B5','B7','B8',
+      'NDVI','EVI','aRE'
+    ])
+    .reduceRegions({
+      collection: sites,
+      reducer: ee.Reducer.mean(),
+      scale: 30,
+      tileScale: 4
+    });
+
+  return out.map(function(f) {
+    return f
+      .set('date', img.get('date'))
+      .set('year', img.get('year'))
+      .set('month', img.get('month'))
+      .set('PRODUCT_URI', img.get('PRODUCT_URI'))
+      .set('CLOUD_COVERAGE', img.get('CLOUD_COVERAGE'))
+      .set('MEAN_SUN_ZENITH_ANGLE', img.get('MEAN_SUN_ZENITH_ANGLE'))
+      .set('MEAN_VIEW_ZENITH_ANGLE', img.get('MEAN_VIEW_ZENITH_ANGLE'))
+      .set('NBAR_SOLAR_ZENITH', img.get('NBAR_SOLAR_ZENITH'));
+  });
+}).flatten();
+
+Export.table.toDrive({
+  collection: extracted,
+  description: 'HLS_S30_NBAR_site_time_series',
+  fileFormat: 'CSV'
+});
