@@ -1,0 +1,759 @@
+/***************************************************************
+ Extract Sentinel-2 reflectance + MODIS PAR for the longest
+ possible same-date record per site.
+
+ Output:
+   - One combined CSV for all sites
+   - One separate CSV per site
+
+ Same-date logic:
+   For each site separately:
+     1. Get all Sentinel-2 dates over the 1 km buffer.
+     2. Extract MODIS PAR for the same date.
+     3. Remove rows without valid S2 reflectance or MODIS PAR.
+
+ Sites:
+   IL_Yat, ES_Hen, ES_Hen2, ES_Yst, GR_San, US_cz2, US_cz3
+
+ Sentinel-2:
+   COPERNICUS/S2_SR_HARMONIZED
+   Reflectance scaled from integer DN to 0–1.
+
+ MODIS PAR:
+   MODIS/062/MCD18C2
+   3-hour PAR bands converted to daily PAR estimate.
+
+ Exported S2 reflectance:
+   B1, B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12
+
+ Additional indices:
+   alphaRE        = R790_B7 / R705_B5 - 1
+   alphaBlue      = R790_B7 / R490_B2 - 1
+   car_chl_index  = alphaBlue / alphaRE
+***************************************************************/
+
+
+// ===============================================================
+// 1. USER SETTINGS
+// ===============================================================
+
+var START_DATE = '2017-03-28';
+var END_DATE = '2030-01-01';
+
+var BUFFER_M = 1000;
+
+var S2_SCALE_M = 20;
+var PAR_SCALE_M = 5600;
+
+// For longest possible time series, keep this relatively permissive.
+// Increase to 0.30 or 0.50 for stricter quality.
+var MIN_VALID_FRACTION = 0.20;
+
+// Basic reflectance sanity filter.
+var REFL_MIN = 0.001;
+var REFL_MAX = 0.900;
+
+// MODIS PAR conversion:
+// MCD18C2 PAR is W m-2 at 3-hour time steps.
+// W m-2 * 10800 seconds * 4.57 umol J-1 / 1e6 = mol m-2 per 3h step.
+var W_M2_3H_TO_MOL = 10800 * 4.57 / 1000000;
+
+
+// ===============================================================
+// 2. SITE TABLE — ALL SITES ACTIVE
+// ===============================================================
+//
+// Coordinates are lon, lat.
+//
+// European coordinates here are rounded from the published site table.
+// Replace with more exact tower coordinates if you have them.
+
+function makeSite(site_id, display_name, lon, lat) {
+  return ee.Feature(ee.Geometry.Point([lon, lat]), {
+    site_id: site_id,
+    display_name: display_name,
+    lon: lon,
+    lat: lat
+  });
+}
+
+var sites = ee.FeatureCollection([
+
+  makeSite('IL_Yat',  'Yatir forest',                  35.051987,   31.345045),
+
+  makeSite('ES_Hen',  'Spain Hen',                     -1.690000,    38.410000),
+  makeSite('ES_Hen2', 'Spain Hen2',                    -1.700000,    38.410000),
+  makeSite('ES_Yst',  'Spain Yst',                     -2.340000,    38.330000),
+  makeSite('GR_San',  'Greece San',                    23.310000,    40.100000),
+
+  makeSite('US_cz2',  'Ponderosa Pine Forest',       -119.256600,   37.031100),
+  makeSite('US_cz3',  'Sierran Mixed Conifer Forest',-119.195100,   37.067400)
+
+]);
+
+var siteBuffers = sites.map(function(f) {
+  return ee.Feature(f).setGeometry(f.geometry().buffer(BUFFER_M));
+});
+
+Map.centerObject(siteBuffers, 4);
+Map.addLayer(
+  siteBuffers.style({
+    color: '000000',
+    fillColor: '00000000',
+    width: 2
+  }),
+  {},
+  '1 km buffers'
+);
+
+print('Sites', sites);
+
+
+// ===============================================================
+// 3. SENTINEL-2 SURFACE REFLECTANCE
+// ===============================================================
+
+var s2BandIds = [
+  'B1',  'B2',  'B3',  'B4',
+  'B5',  'B6',  'B7',  'B8',
+  'B8A', 'B11', 'B12'
+];
+
+var s2BandNames = [
+  'R443_B1',
+  'R490_B2',
+  'R560_B3',
+  'R665_B4',
+  'R705_B5',
+  'R740_B6',
+  'R790_B7',
+  'R842_B8',
+  'R865_B8A',
+  'R1610_B11',
+  'R2190_B12'
+];
+
+var s2Raw = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate(START_DATE, END_DATE)
+  .filterBounds(siteBuffers)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 95));
+
+function prepareS2(img) {
+
+  var scl = img.select('SCL');
+
+  // SCL classes:
+  // 4 = vegetation
+  // 5 = bare soil / non-vegetated
+  //
+  // This keeps land-surface pixels and removes cloud, shadow, snow,
+  // saturated, no-data, water, cirrus, etc.
+  var sclMask = scl.eq(4).or(scl.eq(5));
+
+  var refl = img.select(s2BandIds)
+    .multiply(0.0001)
+    .rename(s2BandNames);
+
+  var r490 = refl.select('R490_B2');
+  var r705 = refl.select('R705_B5');
+  var r790 = refl.select('R790_B7');
+
+  var reflMask = r490.gt(REFL_MIN).and(r490.lt(REFL_MAX))
+    .and(r705.gt(REFL_MIN)).and(r705.lt(REFL_MAX))
+    .and(r790.gt(REFL_MIN)).and(r790.lt(REFL_MAX));
+
+  var mask = sclMask.and(reflMask);
+
+  refl = refl.updateMask(mask);
+
+  var alphaRE = refl.select('R790_B7')
+    .divide(refl.select('R705_B5'))
+    .subtract(1)
+    .rename('alphaRE');
+
+  var alphaBlue = refl.select('R790_B7')
+    .divide(refl.select('R490_B2'))
+    .subtract(1)
+    .rename('alphaBlue');
+
+  // Avoid division by near-zero alphaRE.
+  var alphaREForRatio = alphaRE.updateMask(alphaRE.abs().gt(0.001));
+
+  var carChl = alphaBlue.divide(alphaREForRatio)
+    .rename('car_chl_index');
+
+  var validS2 = alphaRE.mask()
+    .rename('valid_s2')
+    .unmask(0);
+
+  var dateString = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd');
+
+  return refl
+    .addBands(alphaRE)
+    .addBands(alphaBlue)
+    .addBands(carChl)
+    .addBands(validS2)
+    .set('date', dateString)
+    .copyProperties(img, [
+      'system:time_start',
+      'system:index',
+      'SPACECRAFT_NAME',
+      'MGRS_TILE',
+      'SENSING_ORBIT_NUMBER'
+    ]);
+}
+
+var s2 = s2Raw.map(prepareS2);
+
+var s2ExportBands = s2BandNames.concat([
+  'alphaRE',
+  'alphaBlue',
+  'car_chl_index'
+]);
+
+print('Prepared Sentinel-2 collection', s2.limit(5));
+
+
+// ===============================================================
+// 4. MODIS PAR DAILY IMAGE COLLECTION
+// ===============================================================
+
+var parBandIds = [
+  'GMT_0000_PAR',
+  'GMT_0300_PAR',
+  'GMT_0600_PAR',
+  'GMT_0900_PAR',
+  'GMT_1200_PAR',
+  'GMT_1500_PAR',
+  'GMT_1800_PAR',
+  'GMT_2100_PAR'
+];
+
+var parBandNames = [
+  'PAR_GMT_0000_Wm2',
+  'PAR_GMT_0300_Wm2',
+  'PAR_GMT_0600_Wm2',
+  'PAR_GMT_0900_Wm2',
+  'PAR_GMT_1200_Wm2',
+  'PAR_GMT_1500_Wm2',
+  'PAR_GMT_1800_Wm2',
+  'PAR_GMT_2100_Wm2'
+];
+
+var parRaw = ee.ImageCollection('MODIS/062/MCD18C2')
+  .filterDate(START_DATE, END_DATE)
+  .filterBounds(siteBuffers);
+
+function preparePAR(img) {
+
+  var parWm2 = img.select(parBandIds)
+    .rename(parBandNames);
+
+  // Remove invalid/fill values.
+  var parValid = parWm2.updateMask(
+    parWm2.gte(0).and(parWm2.lt(2000))
+  );
+
+  // Positive daylight values only for daily sum / daylight mean.
+  var parPositive = parValid.updateMask(parValid.gt(0));
+
+  var parSumWm2 = parPositive.reduce(ee.Reducer.sum())
+    .rename('PARmodis_sumWm2_3h');
+
+  var parMeanWm2 = parPositive.reduce(ee.Reducer.mean())
+    .rename('PARmodis_meanWm2_daylight');
+
+  var parCount = parPositive.reduce(ee.Reducer.count())
+    .rename('PARmodis_n3h_daylight');
+
+  var parMol = parSumWm2.multiply(W_M2_3H_TO_MOL)
+    .rename('PARmodis_mol_m2_day');
+
+  var dateString = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd');
+
+  return parValid
+    .addBands(parMol)
+    .addBands(parSumWm2)
+    .addBands(parMeanWm2)
+    .addBands(parCount)
+    .set('date', dateString)
+    .copyProperties(img, ['system:time_start']);
+}
+
+var parDaily = parRaw.map(preparePAR);
+
+var parExportBands = parBandNames.concat([
+  'PARmodis_mol_m2_day',
+  'PARmodis_sumWm2_3h',
+  'PARmodis_meanWm2_daylight',
+  'PARmodis_n3h_daylight'
+]);
+
+print('Prepared MODIS PAR collection', parDaily.limit(5));
+
+
+// ===============================================================
+// 5. EXTRACT ONE SITE
+// ===============================================================
+
+var s2Reducer = ee.Reducer.mean()
+  .combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.count(),
+    sharedInputs: true
+  });
+
+var parReducer = ee.Reducer.mean();
+
+function extractOneSite(site) {
+
+  site = ee.Feature(site);
+
+  var siteId = site.get('site_id');
+  var displayName = site.get('display_name');
+  var lon = site.get('lon');
+  var lat = site.get('lat');
+
+  var geom = site.geometry().buffer(BUFFER_M);
+
+  var s2ForSite = s2.filterBounds(geom);
+
+  // Site-specific Sentinel-2 dates.
+  // This keeps the longest possible record for each site separately.
+  var s2Dates = ee.List(
+    s2ForSite.aggregate_array('date')
+  ).distinct().sort();
+
+  var parDefaultDict = ee.Dictionary({
+    PAR_GMT_0000_Wm2: -9999,
+    PAR_GMT_0300_Wm2: -9999,
+    PAR_GMT_0600_Wm2: -9999,
+    PAR_GMT_0900_Wm2: -9999,
+    PAR_GMT_1200_Wm2: -9999,
+    PAR_GMT_1500_Wm2: -9999,
+    PAR_GMT_1800_Wm2: -9999,
+    PAR_GMT_2100_Wm2: -9999,
+    PARmodis_mol_m2_day: -9999,
+    PARmodis_sumWm2_3h: -9999,
+    PARmodis_meanWm2_daylight: -9999,
+    PARmodis_n3h_daylight: 0,
+    has_MODIS_PAR: 0
+  });
+
+  var features = s2Dates.map(function(dateString) {
+
+    dateString = ee.String(dateString);
+
+    var day = ee.Date(dateString);
+    var nextDay = day.advance(1, 'day');
+
+    // -----------------------------
+    // Sentinel-2 same-day composite
+    // -----------------------------
+    var s2Day = s2ForSite.filterDate(day, nextDay);
+
+    var s2Composite = s2Day.select(s2ExportBands).median();
+
+    var validComposite = s2Day.select('valid_s2')
+      .max()
+      .rename('valid_s2');
+
+    var s2Image = s2Composite.addBands(validComposite);
+
+    var s2Stats = s2Image.select(s2ExportBands).reduceRegion({
+      reducer: s2Reducer,
+      geometry: geom,
+      scale: S2_SCALE_M,
+      maxPixels: 1e8,
+      bestEffort: true,
+      tileScale: 4
+    });
+
+    var validFracRaw = s2Image.select('valid_s2').reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: S2_SCALE_M,
+      maxPixels: 1e8,
+      bestEffort: true,
+      tileScale: 4
+    }).get('valid_s2');
+
+    var validFrac = ee.Number(
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(validFracRaw, null),
+        0,
+        validFracRaw
+      )
+    );
+
+    // -----------------------------
+    // MODIS PAR same date
+    // -----------------------------
+    var parDay = parDaily.filterDate(day, nextDay);
+    var hasPar = parDay.size().gt(0);
+
+    var parImage = parDay.mean();
+
+    var parStatsRaw = ee.Dictionary(
+      ee.Algorithms.If(
+        hasPar,
+        parImage.select(parExportBands).reduceRegion({
+          reducer: parReducer,
+          geometry: geom,
+          scale: PAR_SCALE_M,
+          maxPixels: 1e8,
+          bestEffort: true,
+          tileScale: 4
+        }),
+        ee.Dictionary({})
+      )
+    );
+
+    var parStats = parDefaultDict
+      .combine(parStatsRaw, true)
+      .set('has_MODIS_PAR', ee.Number(ee.Algorithms.If(hasPar, 1, 0)));
+
+    return ee.Feature(null)
+      .set(s2Stats)
+      .set(parStats)
+      .set({
+        site_id: siteId,
+        display_name: displayName,
+        lon: lon,
+        lat: lat,
+        date: dateString,
+        buffer_m: BUFFER_M,
+        n_s2_images_site_date: s2Day.size(),
+        valid_frac_s2: validFrac
+      });
+  });
+
+  return ee.FeatureCollection(features);
+}
+
+
+// ===============================================================
+// 6. CREATE SEPARATE SITE TABLES
+// ===============================================================
+
+var IL_Yat_raw  = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'IL_Yat')).first());
+var ES_Hen_raw  = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'ES_Hen')).first());
+var ES_Hen2_raw = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'ES_Hen2')).first());
+var ES_Yst_raw  = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'ES_Yst')).first());
+var GR_San_raw  = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'GR_San')).first());
+var US_cz2_raw  = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'US_cz2')).first());
+var US_cz3_raw  = extractOneSite(sites.filter(ee.Filter.eq('site_id', 'US_cz3')).first());
+
+
+// ===============================================================
+// 7. CLEAN / QA-FILTERED TABLES
+// ===============================================================
+//
+// This is not aggressive outlier removal.
+// It only removes missing PAR, missing reflectance, and low valid-pixel dates.
+
+function cleanExtractedTable(fc) {
+
+  return ee.FeatureCollection(fc)
+
+    // Sentinel-2 must exist for that site/date.
+    .filter(ee.Filter.gt('n_s2_images_site_date', 0))
+
+    // MODIS PAR must exist.
+    .filter(ee.Filter.eq('has_MODIS_PAR', 1))
+
+    // Enough valid S2 pixels inside 1 km buffer.
+    .filter(ee.Filter.gte('valid_frac_s2', MIN_VALID_FRACTION))
+
+    // Required reflectance and PAR.
+    .filter(ee.Filter.notNull([
+      'R490_B2_mean',
+      'R705_B5_mean',
+      'R790_B7_mean',
+      'PARmodis_mol_m2_day'
+    ]))
+
+    // Basic reflectance range.
+    .filter(ee.Filter.gte('R490_B2_mean', REFL_MIN))
+    .filter(ee.Filter.lte('R490_B2_mean', REFL_MAX))
+    .filter(ee.Filter.gte('R705_B5_mean', REFL_MIN))
+    .filter(ee.Filter.lte('R705_B5_mean', REFL_MAX))
+    .filter(ee.Filter.gte('R790_B7_mean', REFL_MIN))
+    .filter(ee.Filter.lte('R790_B7_mean', REFL_MAX))
+
+    // PAR must be positive.
+    .filter(ee.Filter.gt('PARmodis_mol_m2_day', 0));
+}
+
+var IL_Yat_clean  = cleanExtractedTable(IL_Yat_raw);
+var ES_Hen_clean  = cleanExtractedTable(ES_Hen_raw);
+var ES_Hen2_clean = cleanExtractedTable(ES_Hen2_raw);
+var ES_Yst_clean  = cleanExtractedTable(ES_Yst_raw);
+var GR_San_clean  = cleanExtractedTable(GR_San_raw);
+var US_cz2_clean  = cleanExtractedTable(US_cz2_raw);
+var US_cz3_clean  = cleanExtractedTable(US_cz3_raw);
+
+var all_raw = IL_Yat_raw
+  .merge(ES_Hen_raw)
+  .merge(ES_Hen2_raw)
+  .merge(ES_Yst_raw)
+  .merge(GR_San_raw)
+  .merge(US_cz2_raw)
+  .merge(US_cz3_raw);
+
+var all_clean = IL_Yat_clean
+  .merge(ES_Hen_clean)
+  .merge(ES_Hen2_clean)
+  .merge(ES_Yst_clean)
+  .merge(GR_San_clean)
+  .merge(US_cz2_clean)
+  .merge(US_cz3_clean);
+
+print('ALL RAW', all_raw.limit(20));
+print('ALL CLEAN / QA-filtered', all_clean.limit(20));
+
+print('IL_Yat clean count', IL_Yat_clean.size());
+print('ES_Hen clean count', ES_Hen_clean.size());
+print('ES_Hen2 clean count', ES_Hen2_clean.size());
+print('ES_Yst clean count', ES_Yst_clean.size());
+print('GR_San clean count', GR_San_clean.size());
+print('US_cz2 clean count', US_cz2_clean.size());
+print('US_cz3 clean count', US_cz3_clean.size());
+
+
+// ===============================================================
+// 8. QUICK CHARTS
+// ===============================================================
+
+print(
+  ui.Chart.feature.groups({
+    features: all_clean,
+    xProperty: 'date',
+    yProperty: 'PARmodis_mol_m2_day',
+    seriesProperty: 'site_id'
+  })
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'MODIS PAR on Sentinel-2 dates',
+    hAxis: {title: 'Date'},
+    vAxis: {title: 'PAR, mol m-2 day-1'},
+    pointSize: 3,
+    lineWidth: 1
+  })
+);
+
+print(
+  ui.Chart.feature.groups({
+    features: all_clean,
+    xProperty: 'date',
+    yProperty: 'R790_B7_mean',
+    seriesProperty: 'site_id'
+  })
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Sentinel-2 R790 / B7 reflectance',
+    hAxis: {title: 'Date'},
+    vAxis: {title: 'Reflectance'},
+    pointSize: 3,
+    lineWidth: 1
+  })
+);
+
+print(
+  ui.Chart.feature.groups({
+    features: all_clean,
+    xProperty: 'date',
+    yProperty: 'alphaRE_mean',
+    seriesProperty: 'site_id'
+  })
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'alphaRE = R790 / R705 - 1',
+    hAxis: {title: 'Date'},
+    vAxis: {title: 'alphaRE'},
+    pointSize: 3,
+    lineWidth: 1
+  })
+);
+
+
+// ===============================================================
+// 9. EXPORT SELECTORS
+// ===============================================================
+
+var exportSelectors = [
+  'site_id',
+  'display_name',
+  'date',
+  'lon',
+  'lat',
+  'buffer_m',
+  'n_s2_images_site_date',
+  'valid_frac_s2',
+  'has_MODIS_PAR',
+
+  // MODIS PAR daily products
+  'PARmodis_mol_m2_day',
+  'PARmodis_sumWm2_3h',
+  'PARmodis_meanWm2_daylight',
+  'PARmodis_n3h_daylight',
+
+  // MODIS 3-hour PAR values
+  'PAR_GMT_0000_Wm2',
+  'PAR_GMT_0300_Wm2',
+  'PAR_GMT_0600_Wm2',
+  'PAR_GMT_0900_Wm2',
+  'PAR_GMT_1200_Wm2',
+  'PAR_GMT_1500_Wm2',
+  'PAR_GMT_1800_Wm2',
+  'PAR_GMT_2100_Wm2',
+
+  // Sentinel-2 mean reflectance
+  'R443_B1_mean',
+  'R490_B2_mean',
+  'R560_B3_mean',
+  'R665_B4_mean',
+  'R705_B5_mean',
+  'R740_B6_mean',
+  'R790_B7_mean',
+  'R842_B8_mean',
+  'R865_B8A_mean',
+  'R1610_B11_mean',
+  'R2190_B12_mean',
+
+  // Sentinel-2 standard deviation
+  'R443_B1_stdDev',
+  'R490_B2_stdDev',
+  'R560_B3_stdDev',
+  'R665_B4_stdDev',
+  'R705_B5_stdDev',
+  'R740_B6_stdDev',
+  'R790_B7_stdDev',
+  'R842_B8_stdDev',
+  'R865_B8A_stdDev',
+  'R1610_B11_stdDev',
+  'R2190_B12_stdDev',
+
+  // Sentinel-2 valid pixel counts
+  'R443_B1_count',
+  'R490_B2_count',
+  'R560_B3_count',
+  'R665_B4_count',
+  'R705_B5_count',
+  'R740_B6_count',
+  'R790_B7_count',
+  'R842_B8_count',
+  'R865_B8A_count',
+  'R1610_B11_count',
+  'R2190_B12_count',
+
+  // Derived indices
+  'alphaRE_mean',
+  'alphaRE_stdDev',
+  'alphaRE_count',
+
+  'alphaBlue_mean',
+  'alphaBlue_stdDev',
+  'alphaBlue_count',
+
+  'car_chl_index_mean',
+  'car_chl_index_stdDev',
+  'car_chl_index_count'
+];
+
+
+// ===============================================================
+// 10. EXPORT COMBINED TABLES
+// ===============================================================
+//
+// GEE exports CSV. Open CSV directly in Excel.
+
+Export.table.toDrive({
+  collection: all_clean,
+  description: 'ALL_sites_S2_reflectance_MODIS_PAR_same_dates_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'ALL_sites_S2_reflectance_MODIS_PAR_same_dates_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: all_raw,
+  description: 'ALL_sites_S2_reflectance_MODIS_PAR_same_dates_RAW',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'ALL_sites_S2_reflectance_MODIS_PAR_same_dates_RAW',
+  fileFormat: 'CSV'
+});
+
+
+// ===============================================================
+// 11. EXPORT SEPARATE CLEAN TABLE PER SITE
+// ===============================================================
+
+Export.table.toDrive({
+  collection: IL_Yat_clean,
+  description: 'IL_Yat_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'IL_Yat_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: ES_Hen_clean,
+  description: 'ES_Hen_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'ES_Hen_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: ES_Hen2_clean,
+  description: 'ES_Hen2_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'ES_Hen2_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: ES_Yst_clean,
+  description: 'ES_Yst_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'ES_Yst_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: GR_San_clean,
+  description: 'GR_San_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'GR_San_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: US_cz2_clean,
+  description: 'US_cz2_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'US_cz2_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+Export.table.toDrive({
+  collection: US_cz3_clean,
+  description: 'US_cz3_S2_reflectance_MODIS_PAR_CLEAN',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'US_cz3_S2_reflectance_MODIS_PAR_CLEAN',
+  fileFormat: 'CSV',
+  selectors: exportSelectors
+});
+
+print('Done. Run the export tasks from the Tasks tab.');
