@@ -1,7 +1,7 @@
 # Sentinel2-Alpha-LSTM-GPP
 
 ## Overview
-Evaluating environmental controls on dryland forest Gross Primary Productivity (GPP): combining a Sentinel-2 chlorophyll absorption (α) model for GPP estimation with an LSTM-SHAP framework for feature attribution.
+This Github was built upon Ms. Stav Gil bar's thesis: "High-Resolution Remote Sensing of Gross Primary Productivity Reveals Climatic and Local Topo-Edaphic Controls in Dryland Conifer Forests", 2026. Under the Supervision of Prof. Tarin Paz-Kagan and Dr. Yagil Osem.  Evaluating environmental controls on dryland forest Gross Primary Productivity (GPP): combining a Sentinel-2 chlorophyll absorption (α) model for GPP estimation with an LSTM-SHAP framework for feature attribution.
 
 ## Project Workflow
 
