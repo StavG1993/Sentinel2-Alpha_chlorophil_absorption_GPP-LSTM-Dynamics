@@ -27,7 +27,7 @@ Implemented a Spectral Angle Mapper (SAM) quality control procedure. Observation
 Harmonized significant view-angle variability introduced by non-overlapping observations from different orbital swaths for the Spanish and Greek sites (2–3 day temporal resolution).
 
 Applied a localized linear regression separately for each band between a reference 'master' orbit and 'slave' orbits to normalize Bidirectional Reflectance Distribution Function (BRDF) effects.
-**
+
 **PAR Extraction and Calibration (ERS5_MODIS_PAR_GEE)**
 
 Integrated spaceborne PAR products from MODIS (MCD18C2) and ERA5-Land, synchronizing them with Sentinel-2 acquisition dates.
