@@ -1,0 +1,135 @@
+/****  Daily PAR (mol m-2 day-1) from ERA5 + MODIS MCD18C2 at sites -> CSV  ****/
+
+// ------------------------- USER SETTINGS -------------------------
+var startDate = '2015-01-01';
+var endDateUser = '2026-01-31'; // requested end
+var endDate = '2026-01-31'; // clip to "today"
+
+// ------------------------- SITES -------------------------
+var sites = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([35.05,      31.34]),    {site_id: 'IL_31.34_35.05'}),
+  ee.Feature(ee.Geometry.Point([-1.69,      38.41]),    {site_id: 'ES_Hen_1'}),
+  ee.Feature(ee.Geometry.Point([-1.70,      38.41]),    {site_id: 'ES_Hen_2'}),
+  ee.Feature(ee.Geometry.Point([-2.34,      38.33]),    {site_id: 'ES_Yst'}),
+  ee.Feature(ee.Geometry.Point([23.31,      40.10]),    {site_id: 'GR_40.10_23.31'}),
+  ee.Feature(ee.Geometry.Point([-119.2566,  37.0311]),  {site_id: 'US_CA_1'}),
+  ee.Feature(ee.Geometry.Point([-119.1951,  37.0674]),  {site_id: 'US_CA_2'})
+]);
+
+Map.centerObject(sites, 3);
+Map.addLayer(sites, {color: 'red'}, 'Sites');
+
+// ------------------------- HELPERS -------------------------
+function makeDailyDates(start, end) {
+  start = ee.Date(start);
+  end   = ee.Date(end);
+  var n = end.difference(start, 'day');
+  return ee.List.sequence(0, n.subtract(1)).map(function(k) {
+    return start.advance(ee.Number(k), 'day');
+  });
+}
+
+function sampleImageAtSites(img, dateObj) {
+  img = ee.Image(img);
+  return img.sampleRegions({
+    collection: sites,
+    scale: 1000,
+    geometries: false
+  }).map(function(f) {
+    return f.set('date', ee.Date(dateObj).format('YYYY-MM-dd'));
+  });
+}
+
+// =====================================================================
+// 1) ERA5-Land HOURLY -> DAILY PAR [mol m-2 day-1]
+//   SSRD: J m-2 per hour
+//   PAR_day = sum_h( SSRD_h * 0.45 * 4.57e-6 )   [mol m-2 day-1]
+// =====================================================================
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+  .filterDate(startDate, endDate)
+  .select('surface_solar_radiation_downwards');
+
+// hourly -> mol m-2 h-1
+var era5_par_hourly = era5.map(function(img) {
+  return ee.Image(img)
+    .multiply(0.45)      // SW -> PAR fraction (assumption)
+    .multiply(4.57e-6)   // J -> mol (4.57 mol per MJ)
+    .rename('PAR_ERA5_mol_m2_h')
+    .copyProperties(img, ['system:time_start']);
+});
+
+var dailyDates = makeDailyDates(startDate, endDate);
+
+var era5_daily_fc = ee.FeatureCollection(dailyDates.map(function(d) {
+  d = ee.Date(d);
+  var dayCol = era5_par_hourly.filterDate(d, d.advance(1, 'day'));
+  var n = dayCol.size();
+
+  // If empty day (no data), return empty FeatureCollection to avoid crash
+  return ee.FeatureCollection(ee.Algorithms.If(
+    n.gt(0),
+    sampleImageAtSites(dayCol.sum().rename('PAR_ERA5_mol_m2_day'), d)
+      .select(['site_id', 'date', 'PAR_ERA5_mol_m2_day']),
+    ee.FeatureCollection([])
+  ));
+})).flatten();
+
+print('ERA5 daily PAR preview:', era5_daily_fc.limit(5));
+
+// =====================================================================
+// 2) MODIS PAR: MODIS/062/MCD18C2 (8×3-hourly bands per day)
+//   We export:
+//     - PAR_MODIS_sum_native
+//     - PAR_MODIS_mol_m2_day_assume_Wm2 (if each band is W m-2 over 3h)
+// =====================================================================
+var mcd18 = ee.ImageCollection('MODIS/062/MCD18C2')
+  .filterDate(startDate, endDate);
+
+print('MCD18C2 bands:', mcd18.first().bandNames());
+
+var parBands = [
+  'GMT_0000_PAR','GMT_0300_PAR','GMT_0600_PAR','GMT_0900_PAR',
+  'GMT_1200_PAR','GMT_1500_PAR','GMT_1800_PAR','GMT_2100_PAR'
+];
+
+function modisDailyImage(img) {
+  img = ee.Image(img);
+  var par3h = img.select(parBands).max(0);
+
+  var sumNative = par3h.reduce(ee.Reducer.sum())
+    .rename('PAR_MODIS_sum_native');
+
+  var molPer3hFactor = 10800 * 4.57e-6; // W m-2 -> J over 3h -> mol
+  var molDayAssumeWm2 = par3h.multiply(molPer3hFactor)
+    .reduce(ee.Reducer.sum())
+    .rename('PAR_MODIS_mol_m2_day_assume_Wm2');
+
+  return sumNative.addBands(molDayAssumeWm2)
+    .copyProperties(img, ['system:time_start']);
+}
+
+var modis_daily_fc = mcd18.map(function(img) {
+  var d = ee.Date(img.get('system:time_start'));
+  var daily = modisDailyImage(img);
+  return sampleImageAtSites(daily, d)
+    .select(['site_id', 'date', 'PAR_MODIS_sum_native', 'PAR_MODIS_mol_m2_day_assume_Wm2']);
+}).flatten();
+
+print('MODIS daily PAR preview:', modis_daily_fc.limit(5));
+
+// =====================================================================
+// EXPORTS
+// =====================================================================
+Export.table.toDrive({
+  collection: era5_daily_fc,
+  description: 'PAR_ERA5_mol_m2_day_sites',
+  fileNamePrefix: 'PAR_ERA5_mol_m2_day_sites',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: modis_daily_fc,
+  description: 'PAR_MODIS_MCD18C2_sites',
+  fileNamePrefix: 'PAR_MODIS_MCD18C2_sites',
+  fileFormat: 'CSV'
+});
